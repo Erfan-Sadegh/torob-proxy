@@ -1,0 +1,13 @@
+services:
+  torob-proxy:
+    build: .
+    image: torob-reverse-proxy:local
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8080}:80"
+    environment:
+      # Change this if the real Torob API host is different.
+      TOROB_UPSTREAM_SCHEME: "${TOROB_UPSTREAM_SCHEME:-https}"
+      TOROB_UPSTREAM_HOST: "${TOROB_UPSTREAM_HOST:-api.torob.com}"
+      PROXY_TOKEN: "${PROXY_TOKEN:-change-this-token}"
+      CORS_ALLOW_ORIGIN: "${CORS_ALLOW_ORIGIN:-*}"
