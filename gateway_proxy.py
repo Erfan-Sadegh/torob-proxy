@@ -20,6 +20,7 @@ GATEWAY_PROXY_TOKEN = os.getenv("GATEWAY_PROXY_TOKEN", "change-this-token")
 CORS_ALLOW_ORIGIN = os.getenv("CORS_ALLOW_ORIGIN", "*")
 HEALTH_QUERY = os.getenv("HEALTH_QUERY", "رب گوجه")
 BOT_CHALLENGE_COOLDOWN_SECONDS = int(os.getenv("BOT_CHALLENGE_COOLDOWN_SECONDS", "300"))
+HEALTH_CACHE_SECONDS = int(os.getenv("HEALTH_CACHE_SECONDS", "60"))
 
 state_lock = threading.Lock()
 worker_state = {
@@ -27,6 +28,11 @@ worker_state = {
     for worker in WORKER_URLS
 }
 next_worker_index = 0
+health_cache = {
+    "expires_at": 0.0,
+    "status": 503,
+    "payload": {"ok": False, "reason": "not_checked_yet"},
+}
 
 
 class UpstreamResult:
@@ -62,74 +68,90 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self.route(send_body=True)
 
     def route(self, send_body: bool) -> None:
-        parsed = urllib.parse.urlsplit(self.path)
+        try:
+            parsed = urllib.parse.urlsplit(self.path)
 
-        if parsed.path == "/health":
-            self.handle_health(send_body)
-            return
+            if parsed.path == "/live":
+                self.write_json(200, {"ok": True, "service": "torob_gateway"}, send_body)
+                return
 
-        if parsed.path == "/v4/base-product/search":
-            location = "/v4/base-product/search/"
-            if parsed.query:
-                location += "?" + parsed.query
-            self.send_response(308)
-            self.send_header("Location", location)
-            self.end_headers()
-            return
+            if parsed.path == "/health":
+                self.handle_health(send_body)
+                return
 
-        if parsed.path != "/v4/base-product/search/":
-            self.write_json(404, {"error": "not_found"}, send_body)
-            return
+            if parsed.path == "/v4/base-product/search":
+                location = "/v4/base-product/search/"
+                if parsed.query:
+                    location += "?" + parsed.query
+                self.send_response(308)
+                self.send_header("Location", location)
+                self.end_headers()
+                return
 
-        if self.headers.get("X-Proxy-Token") != GATEWAY_PROXY_TOKEN:
-            self.write_json(401, {"error": "unauthorized"}, send_body)
-            return
+            if parsed.path != "/v4/base-product/search/":
+                self.write_json(404, {"error": "not_found"}, send_body)
+                return
 
-        result, failures = self.fetch_valid_search(parsed.query)
-        if result:
-            self.write_upstream(result, send_body)
-            return
+            if self.headers.get("X-Proxy-Token") != GATEWAY_PROXY_TOKEN:
+                self.write_json(401, {"error": "unauthorized"}, send_body)
+                return
 
-        self.write_json(
-            503,
-            {
-                "error": "torob_unavailable",
-                "reason": "all_workers_failed_or_challenged",
-                "failures": failures,
-            },
-            send_body,
-        )
+            result, failures = self.fetch_valid_search(parsed.query)
+            if result:
+                self.write_upstream(result, send_body)
+                return
 
-    def handle_health(self, send_body: bool) -> None:
-        query = urllib.parse.urlencode({"query": HEALTH_QUERY})
-        result, failures = self.fetch_valid_search(query)
-        if result:
             self.write_json(
-                200,
+                503,
                 {
-                    "ok": True,
-                    "worker": result.worker,
-                    "validated_query": HEALTH_QUERY,
-                    "result_count": get_result_count(result.body),
+                    "error": "torob_unavailable",
+                    "reason": "all_workers_failed_or_challenged",
+                    "failures": failures,
                 },
                 send_body,
             )
+        except Exception as exc:
+            print(f"gateway request failed: {exc!r}", flush=True)
+            self.write_json(500, {"error": "gateway_internal_error", "detail": str(exc)}, send_body)
+
+    def handle_health(self, send_body: bool) -> None:
+        cached = get_cached_health()
+        if cached:
+            status, payload = cached
+            self.write_json(status, payload, send_body)
             return
 
-        self.write_json(
-            503,
-            {
-                "ok": False,
+        query = urllib.parse.urlencode({"query": HEALTH_QUERY})
+        result, failures = self.fetch_valid_search(query)
+        if result:
+            payload = {
+                "ok": True,
+                "worker": result.worker,
                 "validated_query": HEALTH_QUERY,
-                "failures": failures,
-            },
-            send_body,
-        )
+                "result_count": get_result_count(result.body),
+                "cache_seconds": HEALTH_CACHE_SECONDS,
+            }
+            set_cached_health(200, payload)
+            self.write_json(200, payload, send_body)
+            return
+
+        payload = {
+            "ok": False,
+            "validated_query": HEALTH_QUERY,
+            "failures": failures,
+            "cache_seconds": HEALTH_CACHE_SECONDS,
+        }
+        set_cached_health(503, payload)
+        self.write_json(503, payload, send_body)
 
     def fetch_valid_search(self, query: str) -> tuple[UpstreamResult | None, list[dict]]:
         failures = []
 
-        for worker in ordered_workers():
+        workers = ordered_workers()
+        if not workers:
+            return None, blocked_worker_failures()
+
+        for worker in workers:
             result, failure = fetch_worker(worker, query)
             if result and is_valid_torob_json(result):
                 mark_worker_ok(worker)
@@ -186,11 +208,40 @@ def ordered_workers() -> list[str]:
             if worker_state[worker]["blocked_until"] <= now
         ]
         if not available:
-            available = list(WORKER_URLS)
+            return []
 
         start = next_worker_index % len(available)
         next_worker_index += 1
         return available[start:] + available[:start]
+
+
+def blocked_worker_failures() -> list[dict]:
+    now = time.time()
+    with state_lock:
+        return [
+            {
+                "worker": worker,
+                "reason": "worker_in_cooldown",
+                "last_error": state["last_error"],
+                "cooldown_remaining_seconds": max(0, int(state["blocked_until"] - now)),
+            }
+            for worker, state in worker_state.items()
+        ]
+
+
+def get_cached_health() -> tuple[int, dict] | None:
+    now = time.time()
+    with state_lock:
+        if health_cache["expires_at"] > now:
+            return int(health_cache["status"]), dict(health_cache["payload"])
+    return None
+
+
+def set_cached_health(status: int, payload: dict) -> None:
+    with state_lock:
+        health_cache["status"] = status
+        health_cache["payload"] = payload
+        health_cache["expires_at"] = time.time() + HEALTH_CACHE_SECONDS
 
 
 def fetch_worker(worker: str, query: str) -> tuple[UpstreamResult | None, dict | None]:
