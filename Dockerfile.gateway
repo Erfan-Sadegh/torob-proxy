@@ -1,10 +1,15 @@
-FROM nginx:1.31-alpine
+FROM python:3.12-alpine
 
-ENV WORKER_1_HOST=torob-proxy.erfanclash20178-calm-moon.svc
-ENV WORKER_2_HOST=torob-proxy-2.erfanclash20178-calm-moon.svc
-ENV WORKER_3_HOST=torob-proxy-3.erfanclash20178-calm-moon.svc
+ENV WORKER_1_URL=http://torob-proxy.erfanclash20178-calm-moon.svc
+ENV WORKER_2_URL=http://torob-proxy-2.erfanclash20178-calm-moon.svc
+ENV WORKER_3_URL=http://torob-proxy-3.erfanclash20178-calm-moon.svc
 ENV WORKER_PROXY_TOKEN=change-this-token
 ENV GATEWAY_PROXY_TOKEN=change-this-token
 ENV CORS_ALLOW_ORIGIN=*
+ENV BOT_CHALLENGE_COOLDOWN_SECONDS=300
+ENV PORT=80
 
-COPY nginx/gateway-templates /etc/nginx/templates
+WORKDIR /app
+COPY gateway_proxy.py /app/gateway_proxy.py
+
+CMD ["python", "/app/gateway_proxy.py"]
