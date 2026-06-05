@@ -16,11 +16,12 @@ jobs:
     container: hamravesh/darkube-cli:v1.1
     needs: darkube_build_torob_proxy_erfanclash20178_calm_moon_hamravesh_c13
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: darkube-cli deploy
         run: |
           for attempt in 1 2 3 4 5; do
-            darkube deploy \
+            timeout 120s darkube deploy \
               --token "${{secrets.DEPLOY_TOKEN_TOROB_PROXY_ERFANCLASH20178_CALM_MOON_HAMRAVESH_C13}}" \
               --app-id "${{secrets.APP_ID_TOROB_PROXY_ERFANCLASH20178_CALM_MOON_HAMRAVESH_C13}}" \
               --image-tag "${GITHUB_SHA:0:7}" \
