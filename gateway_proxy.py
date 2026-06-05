@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import concurrent.futures
 import http.client
 import json
@@ -11,12 +13,18 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 PORT = int(os.getenv("PORT", "80"))
+CONFIGURED_WORKERS = os.getenv("WORKER_URLS", "")
+if CONFIGURED_WORKERS:
+    raw_worker_urls = CONFIGURED_WORKERS.split(",")
+else:
+    raw_worker_urls = [
+        os.getenv("WORKER_1_URL", "https://torob-proxy.darkube.ir"),
+        os.getenv("WORKER_2_URL", "https://torob-proxy-2.darkube.ir"),
+        os.getenv("WORKER_3_URL", "https://torob-proxy-3.darkube.ir"),
+    ]
+
 WORKER_URLS = []
-for worker_url in [
-    os.getenv("WORKER_1_URL", "https://torob-proxy.darkube.ir"),
-    os.getenv("WORKER_2_URL", "https://torob-proxy-2.darkube.ir"),
-    os.getenv("WORKER_3_URL", "https://torob-proxy-3.darkube.ir"),
-]:
+for worker_url in raw_worker_urls:
     worker_url = worker_url.strip().rstrip("/")
     if worker_url and worker_url not in WORKER_URLS:
         WORKER_URLS.append(worker_url)
@@ -28,10 +36,14 @@ BOT_CHALLENGE_COOLDOWN_SECONDS = int(os.getenv("BOT_CHALLENGE_COOLDOWN_SECONDS",
 WORKER_ERROR_COOLDOWN_SECONDS = int(os.getenv("WORKER_ERROR_COOLDOWN_SECONDS", "60"))
 HEALTH_CACHE_SECONDS = int(os.getenv("HEALTH_CACHE_SECONDS", "60"))
 WORKER_TIMEOUT_SECONDS = int(os.getenv("WORKER_TIMEOUT_SECONDS", "8"))
+HEALTH_FAILURE_STATUS = int(os.getenv("HEALTH_FAILURE_STATUS", "200"))
+MIN_WORKER_INTERVAL_SECONDS = float(os.getenv("MIN_WORKER_INTERVAL_SECONDS", "1.2"))
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "86400"))
+CACHE_MAX_ITEMS = int(os.getenv("CACHE_MAX_ITEMS", "1000"))
 
 state_lock = threading.Lock()
 worker_state = {
-    worker: {"blocked_until": 0.0, "last_error": "", "last_ok": 0.0}
+    worker: {"blocked_until": 0.0, "last_error": "", "last_ok": 0.0, "next_request_at": 0.0}
     for worker in WORKER_URLS
 }
 next_worker_index = 0
@@ -40,6 +52,7 @@ health_cache = {
     "status": 503,
     "payload": {"ok": False, "reason": "not_checked_yet"},
 }
+search_cache: dict[str, tuple[float, UpstreamResult]] = {}
 
 
 class UpstreamResult:
@@ -103,9 +116,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 self.write_json(401, {"error": "unauthorized"}, send_body)
                 return
 
+            cached_result = get_cached_search(parsed.query)
+            if cached_result:
+                self.write_upstream(cached_result, send_body, cache_status="HIT")
+                return
+
             result, failures = self.fetch_valid_search(parsed.query)
             if result:
-                self.write_upstream(result, send_body)
+                set_cached_search(parsed.query, result)
+                self.write_upstream(result, send_body, cache_status="MISS")
                 return
 
             self.write_json(
@@ -149,8 +168,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
             "cache_seconds": HEALTH_CACHE_SECONDS,
         }
         print("health check failed: " + json.dumps(payload, ensure_ascii=False), flush=True)
-        set_cached_health(503, payload)
-        self.write_json(503, payload, send_body)
+        set_cached_health(HEALTH_FAILURE_STATUS, payload)
+        self.write_json(HEALTH_FAILURE_STATUS, payload, send_body)
 
     def fetch_valid_search(self, query: str) -> tuple[UpstreamResult | None, list[dict]]:
         failures = []
@@ -212,12 +231,13 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
         return None, failures
 
-    def write_upstream(self, result: UpstreamResult, send_body: bool) -> None:
+    def write_upstream(self, result: UpstreamResult, send_body: bool, cache_status: str = "BYPASS") -> None:
         self.send_response(result.status)
         for key, value in result.headers.items():
             if key.lower() not in BLOCKED_RESPONSE_HEADERS:
                 self.send_header(key, value)
         self.send_header("X-Torob-Worker", result.worker)
+        self.send_header("X-Proxy-Cache", cache_status)
         self.end_headers()
         if send_body:
             self.wfile.write(result.body)
@@ -288,7 +308,56 @@ def set_cached_health(status: int, payload: dict) -> None:
         health_cache["expires_at"] = time.time() + HEALTH_CACHE_SECONDS
 
 
+def normalize_query(query: str) -> str:
+    pairs = urllib.parse.parse_qsl(query, keep_blank_values=True)
+    return urllib.parse.urlencode(sorted(pairs), doseq=True)
+
+
+def get_cached_search(query: str) -> UpstreamResult | None:
+    if CACHE_TTL_SECONDS <= 0:
+        return None
+
+    cache_key = normalize_query(query)
+    now = time.time()
+    with state_lock:
+        cached = search_cache.get(cache_key)
+        if not cached:
+            return None
+        expires_at, result = cached
+        if expires_at <= now:
+            search_cache.pop(cache_key, None)
+            return None
+        return result
+
+
+def set_cached_search(query: str, result: UpstreamResult) -> None:
+    if CACHE_TTL_SECONDS <= 0:
+        return
+
+    cache_key = normalize_query(query)
+    with state_lock:
+        if len(search_cache) >= CACHE_MAX_ITEMS:
+            oldest_key = next(iter(search_cache))
+            search_cache.pop(oldest_key, None)
+        search_cache[cache_key] = (time.time() + CACHE_TTL_SECONDS, result)
+
+
+def wait_worker_turn(worker: str) -> None:
+    if MIN_WORKER_INTERVAL_SECONDS <= 0:
+        return
+
+    with state_lock:
+        now = time.time()
+        wait_seconds = max(0.0, worker_state[worker]["next_request_at"] - now)
+        worker_state[worker]["next_request_at"] = max(now, worker_state[worker]["next_request_at"]) + MIN_WORKER_INTERVAL_SECONDS
+
+    if wait_seconds:
+        time.sleep(wait_seconds)
+
+
 def fetch_worker(worker: str, query: str) -> tuple[UpstreamResult | None, dict | None]:
+    wait_worker_turn(worker)
+
     url = f"{worker}/v4/base-product/search/"
     if query:
         url += "?" + query
