@@ -1,12 +1,15 @@
 FROM python:3.12-alpine
 
-ENV WORKER_1_URL=http://torob-proxy.erfanclash20178-calm-moon.svc
-ENV WORKER_2_URL=http://torob-proxy-2.erfanclash20178-calm-moon.svc
-ENV WORKER_3_URL=http://torob-proxy-3.erfanclash20178-calm-moon.svc
+ENV WORKER_1_URL=https://torob-proxy.darkube.ir
+ENV WORKER_2_URL=https://torob-proxy-2.darkube.ir
+ENV WORKER_3_URL=https://torob-proxy-3.darkube.ir
 ENV WORKER_PROXY_TOKEN=change-this-token
 ENV GATEWAY_PROXY_TOKEN=change-this-token
 ENV CORS_ALLOW_ORIGIN=*
 ENV BOT_CHALLENGE_COOLDOWN_SECONDS=300
+ENV WORKER_ERROR_COOLDOWN_SECONDS=60
+ENV HEALTH_CACHE_SECONDS=60
+ENV WORKER_TIMEOUT_SECONDS=8
 ENV PORT=80
 
 WORKDIR /app

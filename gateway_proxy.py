@@ -1,5 +1,6 @@
-import json
+import concurrent.futures
 import http.client
+import json
 import os
 import threading
 import time
@@ -11,16 +12,18 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(os.getenv("PORT", "80"))
 WORKER_URLS = [
-    os.getenv("WORKER_1_URL", "http://torob-proxy.erfanclash20178-calm-moon.svc").rstrip("/"),
-    os.getenv("WORKER_2_URL", "http://torob-proxy-2.erfanclash20178-calm-moon.svc").rstrip("/"),
-    os.getenv("WORKER_3_URL", "http://torob-proxy-3.erfanclash20178-calm-moon.svc").rstrip("/"),
+    os.getenv("WORKER_1_URL", "https://torob-proxy.darkube.ir").rstrip("/"),
+    os.getenv("WORKER_2_URL", "https://torob-proxy-2.darkube.ir").rstrip("/"),
+    os.getenv("WORKER_3_URL", "https://torob-proxy-3.darkube.ir").rstrip("/"),
 ]
 WORKER_PROXY_TOKEN = os.getenv("WORKER_PROXY_TOKEN", "change-this-token")
 GATEWAY_PROXY_TOKEN = os.getenv("GATEWAY_PROXY_TOKEN", "change-this-token")
 CORS_ALLOW_ORIGIN = os.getenv("CORS_ALLOW_ORIGIN", "*")
-HEALTH_QUERY = os.getenv("HEALTH_QUERY", "رب گوجه")
+HEALTH_QUERY = os.getenv("HEALTH_QUERY", "\u0631\u0628 \u06af\u0648\u062c\u0647")
 BOT_CHALLENGE_COOLDOWN_SECONDS = int(os.getenv("BOT_CHALLENGE_COOLDOWN_SECONDS", "300"))
+WORKER_ERROR_COOLDOWN_SECONDS = int(os.getenv("WORKER_ERROR_COOLDOWN_SECONDS", "60"))
 HEALTH_CACHE_SECONDS = int(os.getenv("HEALTH_CACHE_SECONDS", "60"))
+WORKER_TIMEOUT_SECONDS = int(os.getenv("WORKER_TIMEOUT_SECONDS", "8"))
 
 state_lock = threading.Lock()
 worker_state = {
@@ -122,7 +125,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return
 
         query = urllib.parse.urlencode({"query": HEALTH_QUERY})
-        result, failures = self.fetch_valid_search(query)
+        result, failures = self.fetch_valid_search_concurrent(query)
         if result:
             payload = {
                 "ok": True,
@@ -146,7 +149,6 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
     def fetch_valid_search(self, query: str) -> tuple[UpstreamResult | None, list[dict]]:
         failures = []
-
         workers = ordered_workers()
         if not workers:
             return None, blocked_worker_failures()
@@ -160,11 +162,48 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if failure is None and result is not None:
                 failure = classify_invalid_response(result)
             failures.append({"worker": worker, **(failure or {"reason": "unknown"})})
+            mark_failed_worker(worker, failure)
 
-            if failure and failure.get("reason") == "bot_challenge":
-                mark_worker_blocked(worker, failure["reason"])
-            elif failure:
-                mark_worker_error(worker, failure.get("reason", "failed"))
+        return None, failures
+
+    def fetch_valid_search_concurrent(self, query: str) -> tuple[UpstreamResult | None, list[dict]]:
+        workers = ordered_workers()
+        if not workers:
+            return None, blocked_worker_failures()
+
+        failures = []
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(workers))
+        futures = {executor.submit(fetch_worker, worker, query): worker for worker in workers}
+
+        try:
+            for future in concurrent.futures.as_completed(futures, timeout=WORKER_TIMEOUT_SECONDS + 2):
+                worker = futures[future]
+                result, failure = future.result()
+                if result and is_valid_torob_json(result):
+                    mark_worker_ok(worker)
+                    for pending_future, pending_worker in futures.items():
+                        if pending_worker != worker and not pending_future.done():
+                            mark_worker_error(pending_worker, "health_probe_incomplete")
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    return result, failures
+
+                if failure is None and result is not None:
+                    failure = classify_invalid_response(result)
+                failures.append({"worker": worker, **(failure or {"reason": "unknown"})})
+                mark_failed_worker(worker, failure)
+        except concurrent.futures.TimeoutError:
+            pass
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+        for future, worker in futures.items():
+            if not future.done():
+                failure = {
+                    "reason": "request_timeout",
+                    "detail": f"timed out after {WORKER_TIMEOUT_SECONDS}s",
+                }
+                failures.append({"worker": worker, **failure})
+                mark_failed_worker(worker, failure)
 
         return None, failures
 
@@ -260,7 +299,7 @@ def fetch_worker(worker: str, query: str) -> tuple[UpstreamResult | None, dict |
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=25) as response:
+        with urllib.request.urlopen(request, timeout=WORKER_TIMEOUT_SECONDS) as response:
             body = safe_read(response)
             return UpstreamResult(worker, response.status, dict(response.headers.items()), body), None
     except urllib.error.HTTPError as exc:
@@ -292,7 +331,12 @@ def classify_invalid_response(result: UpstreamResult) -> dict:
     text = result.body[:4096].decode("utf-8", errors="ignore").lower()
     content_type = result.headers.get("Content-Type", result.headers.get("content-type", ""))
 
-    if result.status == 490 or "آیا شما یک ربات هستید" in text or "arcaptcha" in text or "trb_clearance" in text:
+    if (
+        result.status == 490
+        or "\u0622\u06cc\u0627 \u0634\u0645\u0627 \u06cc\u06a9 \u0631\u0628\u0627\u062a \u0647\u0633\u062a\u06cc\u062f" in text
+        or "arcaptcha" in text
+        or "trb_clearance" in text
+    ):
         return {
             "reason": "bot_challenge",
             "status": result.status,
@@ -325,12 +369,20 @@ def mark_worker_ok(worker: str) -> None:
 def mark_worker_error(worker: str, reason: str) -> None:
     with state_lock:
         worker_state[worker]["last_error"] = reason
+        worker_state[worker]["blocked_until"] = time.time() + WORKER_ERROR_COOLDOWN_SECONDS
 
 
 def mark_worker_blocked(worker: str, reason: str) -> None:
     with state_lock:
         worker_state[worker]["blocked_until"] = time.time() + BOT_CHALLENGE_COOLDOWN_SECONDS
         worker_state[worker]["last_error"] = reason
+
+
+def mark_failed_worker(worker: str, failure: dict | None) -> None:
+    if failure and failure.get("reason") == "bot_challenge":
+        mark_worker_blocked(worker, failure["reason"])
+    elif failure:
+        mark_worker_error(worker, failure.get("reason", "failed"))
 
 
 if __name__ == "__main__":
