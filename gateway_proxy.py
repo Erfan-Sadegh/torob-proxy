@@ -11,11 +11,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 PORT = int(os.getenv("PORT", "80"))
-WORKER_URLS = [
-    os.getenv("WORKER_1_URL", "https://torob-proxy.darkube.ir").rstrip("/"),
-    os.getenv("WORKER_2_URL", "https://torob-proxy-2.darkube.ir").rstrip("/"),
-    os.getenv("WORKER_3_URL", "https://torob-proxy-3.darkube.ir").rstrip("/"),
-]
+WORKER_URLS = []
+for worker_url in [
+    os.getenv("WORKER_1_URL", "https://torob-proxy.darkube.ir"),
+    os.getenv("WORKER_2_URL", "https://torob-proxy-2.darkube.ir"),
+    os.getenv("WORKER_3_URL", "https://torob-proxy-3.darkube.ir"),
+]:
+    worker_url = worker_url.strip().rstrip("/")
+    if worker_url and worker_url not in WORKER_URLS:
+        WORKER_URLS.append(worker_url)
 WORKER_PROXY_TOKEN = os.getenv("WORKER_PROXY_TOKEN", "change-this-token")
 GATEWAY_PROXY_TOKEN = os.getenv("GATEWAY_PROXY_TOKEN", "change-this-token")
 CORS_ALLOW_ORIGIN = os.getenv("CORS_ALLOW_ORIGIN", "*")
