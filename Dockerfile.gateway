@@ -1,5 +1,7 @@
 FROM python:3.12-alpine
 
+RUN apk add --no-cache ca-certificates
+
 ENV WORKER_1_URL=https://torob-proxy.darkube.ir
 ENV WORKER_2_URL=https://torob-proxy-2.darkube.ir
 ENV WORKER_3_URL=https://torob-proxy-3.darkube.ir

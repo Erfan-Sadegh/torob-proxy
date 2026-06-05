@@ -148,6 +148,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             "failures": failures,
             "cache_seconds": HEALTH_CACHE_SECONDS,
         }
+        print("health check failed: " + json.dumps(payload, ensure_ascii=False), flush=True)
         set_cached_health(503, payload)
         self.write_json(503, payload, send_body)
 
