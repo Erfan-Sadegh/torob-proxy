@@ -24,7 +24,8 @@ server {
         }
 
         if ($http_x_proxy_token != "${PROXY_TOKEN}") {
-            return 401;
+            add_header Content-Type text/plain always;
+            return 401 "unauthorized\n";
         }
 
         proxy_pass ${TOROB_UPSTREAM_SCHEME}://${TOROB_UPSTREAM_HOST};
