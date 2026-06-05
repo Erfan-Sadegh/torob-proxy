@@ -18,7 +18,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: darkube-cli deploy
-        run: 'darkube deploy --token ${{secrets.DEPLOY_TOKEN_TOROB_PROXY_ERFANCLASH20178_CALM_MOON_HAMRAVESH_C13}} --app-id ${{secrets.APP_ID_TOROB_PROXY_ERFANCLASH20178_CALM_MOON_HAMRAVESH_C13}} --image-tag ${GITHUB_SHA:0:7} --job-id ${GITHUB_RUN_ID}'
+        run: |
+          for attempt in 1 2 3 4 5; do
+            darkube deploy \
+              --token "${{secrets.DEPLOY_TOKEN_TOROB_PROXY_ERFANCLASH20178_CALM_MOON_HAMRAVESH_C13}}" \
+              --app-id "${{secrets.APP_ID_TOROB_PROXY_ERFANCLASH20178_CALM_MOON_HAMRAVESH_C13}}" \
+              --image-tag "${GITHUB_SHA:0:7}" \
+              --job-id "${GITHUB_RUN_ID}" && exit 0
+            sleep 20
+          done
+          exit 1
 'on':
   push:
     branches:
