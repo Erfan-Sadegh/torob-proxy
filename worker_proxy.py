@@ -15,6 +15,7 @@ CORS_ALLOW_ORIGIN = os.getenv("CORS_ALLOW_ORIGIN", "*")
 
 class WorkerProxyHandler(BaseHTTPRequestHandler):
     server_version = "torob-worker-proxy/1.0"
+    protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt: str, *args) -> None:
         print("%s - %s" % (self.address_string(), fmt % args), flush=True)
